@@ -32,35 +32,43 @@ isSignature xs =
         (_:b:_) -> not (isSpace (head xs)) && (b == "::")
         _ -> False
 
-haskellSnippet :: Fold IO String [String]
+haskellSnippet :: Fold IO (Int, String) [(Int, String)]
 haskellSnippet =
-    Fold.takeEndBy_ haskellCodeStart Fold.drain
-        `Fold.serial_` Fold.takeEndBy_ codeEndIndicator Fold.toList
+    Fold.serial_
+        (Fold.takeEndBy_ (haskellCodeStart . snd) Fold.drain)
+        (Fold.takeEndBy_ (codeEndIndicator . snd) Fold.toList)
 
-haskellBlock :: Parser String IO [String]
+haskellBlock :: Parser (Int, String) IO [(Int, String)]
 haskellBlock = do
     Just ln <- Parser.fromFold Fold.one
-    if isSignature ln
+    if isSignature (snd ln)
     then do
         Just nextln <- Parser.fromFold Fold.one
-        rest <- Parser.takeWhile (not . blockEndIndicator) Fold.toList
+        rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
         return (ln : nextln : rest)
     else do
-        rest <- Parser.takeWhile (not . blockEndIndicator) Fold.toList
+        rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
         return (ln : rest)
 
-trim :: String -> String
-trim = takeWhile (not . isSpace) . dropWhile isSpace
+extractSrcLoc :: Bool -> [(Int, String)] -> (Int, String)
+extractSrcLoc _ [] = (0, [])
+extractSrcLoc addNewlines xs@((i, _):_) =
+    if addNewlines
+    then (i, unlines (map snd xs))
+    else (i, concat (map snd xs))
 
-parseString :: String -> IO [String]
+parseString :: String -> IO [(Int, String)]
 parseString s = do
+    let withLoc = zip [1 ..] (lines s)
     res <-
-        Stream.fromList (lines s) & Stream.foldMany haskellSnippet
+        Stream.fromList withLoc & Stream.foldMany haskellSnippet
             & Stream.mapM
                   (Stream.fold Fold.toList
                        . Stream.parseMany haskellBlock . Stream.fromList)
             & Stream.fold Fold.toList
-    return $ filter (not . null) $ fmap unlines $ fmap (fmap unlines) res
+    return
+        $ filter (not . null . snd)
+        $ fmap (extractSrcLoc False) $ fmap (fmap (extractSrcLoc True)) res
 
 hasError :: String -> Bool
 hasError out =
@@ -69,26 +77,32 @@ hasError out =
             Nothing -> False
             Just _ -> True
 
-loopCmd :: [String] -> IO ()
-loopCmd [] = do
-    putStrLn "All good"
-    exitSuccess
+loopCmd :: [(Int, String)] -> IO (Maybe ((Int, String), String))
+loopCmd [] = return Nothing
 loopCmd (snip:snips) = do
-    writeFile ("interpreted.hs") snip
+    let padding = replicate (fst snip - 1) '\n'
+    writeFile ("interpreted.hs") (padding ++ snd snip)
     (_, _, resErr) <-
         readProcessWithExitCode "timeout" ["2s", "ghci", "interpreted.hs"] ""
     if hasError resErr
-    then do
-        putStrLn "Failed"
-        putStrLn snip
-        putStrLn resErr
-        exitFailure
+    then return $ Just (snip, resErr)
     else loopCmd snips
+
 
 main :: IO ()
 main = do
     args <- getArgs
     let [fileName] = args
     contents <- readFile fileName
-    res <- parseString contents
-    loopCmd res
+    parsed <- parseString contents
+    res <- loopCmd parsed
+    case res of
+        Just (snip, resErr) -> do
+            putStrLn (snd snip)
+            putStrLn resErr
+            putStrLn
+                ("Error at snippet: " ++ fileName ++ ":" ++ show (fst snip))
+            exitFailure
+        Nothing -> do
+            putStrLn "All good"
+            exitSuccess

@@ -1,15 +1,14 @@
-module Main where
+module Main (main) where
 
-import Control.Monad (forM_)
+import Control.Monad (void)
 import Data.Char (isSpace)
 import Data.Function ((&))
 import Data.List (find, isPrefixOf)
 import Streamly.Data.Fold (Fold)
 import Streamly.Data.Parser (Parser)
 import System.Environment (getArgs)
-import System.Process (readProcessWithExitCode)
-import System.Exit (ExitCode(..), exitFailure, exitSuccess)
 
+import qualified Language.Haskell.Ghcid as G
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Parser as Parser
 import qualified Streamly.Data.Stream as Stream
@@ -68,41 +67,49 @@ parseString s = do
             & Stream.fold Fold.toList
     return
         $ filter (not . null . snd)
-        $ fmap (extractSrcLoc False) $ fmap (fmap (extractSrcLoc True)) res
+        $ concat
+        $ fmap
+              (fmap (fmap (\x -> ":{\n" ++ x ++ ":}") . extractSrcLoc True))
+              res
 
 hasError :: String -> Bool
 hasError out =
     let xs = lines out
-     in case find ("interpreted.hs:" `isPrefixOf`) xs of
+     in case find ("<interactive>:" `isPrefixOf`) xs of
             Nothing -> False
             Just _ -> True
 
-loopCmd :: [(Int, String)] -> IO (Maybe ((Int, String), String))
-loopCmd [] = return Nothing
-loopCmd (snip:snips) = do
-    let padding = replicate (fst snip - 1) '\n'
-    writeFile ("interpreted.hs") (padding ++ snd snip)
-    (_, _, resErr) <-
-        readProcessWithExitCode "timeout" ["2s", "ghci", "interpreted.hs"] ""
-    if hasError resErr
-    then return $ Just (snip, resErr)
-    else loopCmd snips
+loopCmd :: G.Ghci -> [(Int, String)] -> IO ()
+loopCmd _ [] = putStrLn "All good"
+loopCmd sess (ln:lns) = do
+    putStrLn (snd ln)
+    res <- G.exec sess (snd ln)
+    if or (map hasError res)
+    then do
+        mapM_ putStrLn res
+        putStrLn ("Error at: " ++ show (fst ln))
+    else loopCmd sess lns
 
+ghciSetup :: [String]
+ghciSetup = [":set -fobject-code"]
 
 main :: IO ()
 main = do
     args <- getArgs
-    let [fileName] = args
+    (ghciSession, _) <-
+        G.startGhci
+            "ghci"
+            (Just ".")
+            (\strm str ->
+                 case strm of
+                     G.Stdout -> putStrLn ("<stdout>: " ++ str)
+                     G.Stderr -> putStrLn ("<stderr>: " ++ str))
+    sequence_ $ map (G.exec ghciSession) ghciSetup
+    void $ G.reload ghciSession
+    let fileName =
+            case args of
+                [x] -> x
+                _ -> error "Expecting exactly 1 argument"
     contents <- readFile fileName
     parsed <- parseString contents
-    res <- loopCmd parsed
-    case res of
-        Just (snip, resErr) -> do
-            putStrLn (snd snip)
-            putStrLn resErr
-            putStrLn
-                ("Error at snippet: " ++ fileName ++ ":" ++ show (fst snip))
-            exitFailure
-        Nothing -> do
-            putStrLn "All good"
-            exitSuccess
+    loopCmd ghciSession parsed

@@ -15,13 +15,13 @@ import qualified Streamly.Data.Stream as Stream
 import qualified Streamly.Internal.Data.Fold as Fold (serial_)
 
 haskellCodeStart :: String -> Bool
-haskellCodeStart = isPrefixOf "```haskell"
+haskellCodeStart = (==) "```haskell" . takeWhile (/= '\n')
 
 ghciCodeStart :: String -> Bool
-ghciCodeStart = isPrefixOf "```ghci"
+ghciCodeStart = (==) "```haskell ghci" . takeWhile (/= '\n')
 
 docspecCodeStart :: String -> Bool
-docspecCodeStart = isPrefixOf "```docspec"
+docspecCodeStart = (==) "```haskell docspec" . takeWhile (/= '\n')
 
 codeEndIndicator :: String -> Bool
 codeEndIndicator = isPrefixOf "```"

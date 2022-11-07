@@ -16,11 +16,11 @@ Note: The ghc environment file should exist.
 
 ## Syntax
 
-3 type of codeblocks are permitted,
+3 type of codeblocks are parsed,
 
-- haskell
-- ghci
-- docspec
+- `haskell`
+- `haskell ghci`
+- `haskell docspec`
 
 All the codeblocks share the same ghci session
 
@@ -34,7 +34,7 @@ Example,
 
 Multiple `ghci` blocks share the same ghci session.
 
-```ghci
+```haskell ghci
 import Data.Function ((&))
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Stream as Stream
@@ -47,7 +47,7 @@ f1 x =
         & Stream.fold Fold.toList                      -- Fold the resulting stream into a list
 ```
 
-```ghci
+```haskell ghci
 import Data.Maybe (fromJust)
 
 f2 x =
@@ -112,7 +112,7 @@ f2 x =
 `docspec` blocks can be used to check results after execution. The `ghci` block
 is a simpler version of `docspec` block.
 
-```docspec
+```haskell docspec
 >>> import qualified Streamly.Internal.Data.Array as Array
 >>> :{
   Stream.fromList [1,2,3,4,5::Int]

@@ -109,6 +109,12 @@ parseString startIndicator s = do
                    . Stream.parseMany haskellBlock . Stream.fromList)
         & Stream.fold Fold.toList
 
+saitizeREPLStatement :: String -> String
+saitizeREPLStatement str =
+    if "{-# LANGUAGE" `isPrefixOf` str
+    then ":set -X" ++ takeWhile (not . isSpace) (drop 13 str) ++ "\n"
+    else str
+
 parseStringREPL :: String -> IO [(Int, String)]
 parseStringREPL s = do
     res <- parseString ghciCodeStart s
@@ -116,7 +122,9 @@ parseStringREPL s = do
         $ filter (not . null . snd)
         $ concat
         $ fmap
-              (fmap (fmap (\x -> ":{\n" ++ x ++ ":}") . extractSrcLoc True))
+              (fmap
+                   (fmap (\x -> ":{\n" ++ saitizeREPLStatement x ++ ":}")
+                        . extractSrcLoc True))
               res
 
 hasErrorREPL :: String -> Bool

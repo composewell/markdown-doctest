@@ -40,6 +40,9 @@ docspecMultiIndicator = isPrefixOf ">>> :{"
 docspecMultiEndIndicator :: String -> Bool
 docspecMultiEndIndicator = isPrefixOf ":}"
 
+isInlineStatement :: String -> Bool
+isInlineStatement str = "{-# INLINE" `isPrefixOf` str
+
 isSignature :: String -> Bool
 isSignature xs =
     case words xs of
@@ -55,11 +58,17 @@ snippet startIndicator =
 haskellBlock :: Parser (Int, String) IO [(Int, String)]
 haskellBlock = do
     Just ln <- Parser.fromFold Fold.one
-    if isSignature (snd ln)
+    if isSignature (snd ln) || isInlineStatement (snd ln)
     then do
         Just nextln <- Parser.fromFold Fold.one
-        rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-        return (ln : nextln : rest)
+        if isSignature (snd ln) || isInlineStatement (snd ln)
+        then do
+            Just nextNextln <- Parser.fromFold Fold.one
+            rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
+            return (ln : nextln : nextNextln : rest)
+        else do
+            rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
+            return (ln : nextln : rest)
     else do
         rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
         return (ln : rest)

@@ -55,23 +55,33 @@ snippet startIndicator =
         (Fold.takeEndBy_ (startIndicator . snd) Fold.drain)
         (Fold.takeEndBy_ (codeEndIndicator . snd) Fold.toList)
 
-haskellBlock :: Parser (Int, String) IO [(Int, String)]
+data Block a
+    = WithMeta1 a
+    | WithMeta2 a
+    | WithoutMeta a
+
+unBlock :: Block a -> a
+unBlock (WithMeta1 a) = a
+unBlock (WithMeta2 a) = a
+unBlock (WithoutMeta a) = a
+
+haskellBlock :: Parser (Int, String) IO (Block [(Int, String)])
 haskellBlock = do
     Just ln <- Parser.fromFold Fold.one
     if isSignature (snd ln) || isInlineStatement (snd ln)
     then do
         Just nextln <- Parser.fromFold Fold.one
-        if isSignature (snd ln) || isInlineStatement (snd ln)
+        if isSignature (snd nextln) || isInlineStatement (snd nextln)
         then do
             Just nextNextln <- Parser.fromFold Fold.one
             rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-            return (ln : nextln : nextNextln : rest)
+            return $ WithMeta2 (ln : nextln : nextNextln : rest)
         else do
             rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-            return (ln : nextln : rest)
+            return $ WithMeta1 (ln : nextln : rest)
     else do
         rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-        return (ln : rest)
+        return $ WithoutMeta (ln : rest)
 
 docspecBlock :: Parser (Int, String) IO ([(Int, String)], [(Int, String)])
 docspecBlock = do
@@ -109,7 +119,7 @@ parseDocspecBlocks s = do
         $ map (\(a, b) -> (extractSrcLoc True a, concat (map snd b)))
         $ concat res
 
-parseString :: (String -> Bool) -> String -> IO [[[(Int, String)]]]
+parseString :: (String -> Bool) -> String -> IO [[Block [(Int, String)]]]
 parseString startIndicator s = do
     let withLoc = zip [1 ..] (lines s)
     Stream.fromList withLoc & Stream.foldMany (snippet startIndicator)
@@ -127,14 +137,22 @@ saitizeREPLStatement str =
 parseStringREPL :: String -> IO [(Int, String)]
 parseStringREPL s = do
     res <- parseString ghciCodeStart s
+    let blocks = concat res
     return
         $ filter (not . null . snd)
-        $ concat
         $ fmap
-              (fmap
-                   (fmap (\x -> ":{\n" ++ saitizeREPLStatement x ++ ":}")
-                        . extractSrcLoc True))
-              res
+              (fmap (\x -> ":{\n" ++ saitizeREPLStatement x ++ ":}")
+                   . extractSrcLoc True)
+        $ loopBlocks blocks
+
+    where
+
+    -- This is reqiured because for some reason, GhcId can't register signatures
+    -- after a while. Functions don't get into scope after a while.
+    loopBlocks [] = []
+    loopBlocks (WithMeta1 b:bs) = [b, drop 1 b] ++ loopBlocks bs
+    loopBlocks (WithMeta2 b:bs) = [b, drop 2 b] ++ loopBlocks bs
+    loopBlocks (WithoutMeta b:bs) = [b] ++ loopBlocks bs
 
 hasErrorREPL :: String -> Bool
 hasErrorREPL out =
@@ -148,7 +166,8 @@ parseStringFile s = do
     res <- parseString haskellCodeStart s
     return
         $ filter (not . null . snd)
-        $ fmap (extractSrcLoc False) $ fmap (fmap (extractSrcLoc True)) res
+        $ fmap (extractSrcLoc False)
+        $ fmap (fmap (extractSrcLoc True . unBlock)) res
 
 hasErrorFile :: String -> Bool
 hasErrorFile out =
@@ -236,3 +255,4 @@ main = do
     when r2 $ do
         parsedFile <- parseStringFile contents
         void $ loopCmdFile ghciSession parsedFile
+    G.stopGhci ghciSession

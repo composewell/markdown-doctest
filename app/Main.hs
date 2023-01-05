@@ -12,7 +12,7 @@ import qualified Language.Haskell.Ghcid as G
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Parser as Parser
 import qualified Streamly.Data.Stream as Stream
-import qualified Streamly.Internal.Data.Fold as Fold (serial_)
+import qualified Streamly.Internal.Data.Fold as Fold (split_)
 
 haskellCodeStart :: String -> Bool
 haskellCodeStart = (==) "```haskell" . takeWhile (/= '\n')
@@ -51,7 +51,7 @@ isSignature xs =
 
 snippet :: (String -> Bool) -> Fold IO (Int, String) [(Int, String)]
 snippet startIndicator =
-    Fold.serial_
+    Fold.split_
         (Fold.takeEndBy_ (startIndicator . snd) Fold.drain)
         (Fold.takeEndBy_ (codeEndIndicator . snd) Fold.toList)
 
@@ -92,7 +92,7 @@ docspecBlock = do
         let specFld =
                 Fold.takeEndBy_ (docspecMultiEndIndicator . snd) Fold.toList
             resFld = Fold.toList
-            fld = Fold.serialWith (,) specFld resFld
+            fld = Fold.splitWith (,) specFld resFld
         Parser.fromEffect (Stream.fold fld (Stream.fromList rest))
     else do
         let fld = Fold.toList
@@ -110,23 +110,36 @@ parseDocspecBlocks :: String -> IO [((Int, String), String)]
 parseDocspecBlocks s = do
     let withLoc = zip [1 ..] (lines s)
     res <-
-        Stream.fromList withLoc & Stream.foldMany (snippet docspecCodeStart)
-            & Stream.mapM
-                  (Stream.fold Fold.toList
-                       . Stream.parseMany docspecBlock . Stream.fromList)
+        Stream.fromList withLoc
+            & Stream.foldMany (snippet docspecCodeStart)
+            & Stream.mapM blocks
             & Stream.fold Fold.toList
     return
         $ map (\(a, b) -> (extractSrcLoc True a, concat (map snd b)))
         $ concat res
 
+    where
+
+    blocks =
+          Stream.fold Fold.toList
+        . fmap (either (error . show) id)
+        . Stream.parseMany docspecBlock
+        . Stream.fromList
+
 parseString :: (String -> Bool) -> String -> IO [[Block [(Int, String)]]]
 parseString startIndicator s = do
     let withLoc = zip [1 ..] (lines s)
     Stream.fromList withLoc & Stream.foldMany (snippet startIndicator)
-        & Stream.mapM
-              (Stream.fold Fold.toList
-                   . Stream.parseMany haskellBlock . Stream.fromList)
+        & Stream.mapM blocks
         & Stream.fold Fold.toList
+
+    where
+
+    blocks =
+        Stream.fold Fold.toList
+      . fmap (either (error . show) id)
+      . Stream.parseMany haskellBlock
+      . Stream.fromList
 
 saitizeREPLStatement :: String -> String
 saitizeREPLStatement str =

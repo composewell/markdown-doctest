@@ -7,8 +7,7 @@ import Data.List (find, isPrefixOf)
 import Streamly.Data.Fold (Fold)
 import Streamly.Data.Parser (Parser)
 import System.Environment (getArgs)
-import System.IO.Temp (withSystemTempDirectory)
-import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempFile)
 
 import qualified Language.Haskell.Ghcid as G
 import qualified Streamly.Data.Fold as Fold
@@ -228,12 +227,11 @@ loopCmdREPL sess (ln:lns) = do
 loopCmdFile :: G.Ghci -> [(Int, String)] -> IO Bool
 loopCmdFile _ [] = putStrLn "All good" >> return True
 loopCmdFile sess (ln:lns) =
-    withSystemTempDirectory "docTest" $ \fp -> do
+    withSystemTempFile "docTest" $ \fp _fh -> do
         let padding = replicate (fst ln - 1) '\n'
-            tgt = fp </> "interpreted.hs"
-        writeFile tgt (padding ++ snd ln)
+        writeFile fp (padding ++ snd ln)
         putStrLn (snd ln)
-        res <- G.exec sess (":load " ++ show tgt)
+        res <- G.exec sess (":load " ++ fp)
         if or (map hasErrorFile res)
         then do
             mapM_ putStrLn res

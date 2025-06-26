@@ -18,111 +18,35 @@ Note: The ghc environment file should exist.
 
 3 type of codeblocks are parsed,
 
-- `haskell`
-- `haskell ghci`
-- `haskell docspec`
+- `haskell`: All `haskell` blocks are tangled into a common file and checked.
+- `haskell unshared`: These blocks are loaded independently and dont share anything.
+- `haskell docspec`: These blocks share the syntax of docspec and share the env.
 
-All the codeblocks share the same ghci session
+## Example
 
-Example,
-
-````
-
-# Examples
-
-## Example 1,
-
-Multiple `ghci` blocks share the same ghci session.
-
-```haskell ghci
-import Data.Function ((&))
-import qualified Streamly.Data.Fold as Fold
-import qualified Streamly.Data.Stream as Stream
-import qualified Streamly.Data.Stream.Concurrent as Concur
-
-f1 x =
-    Prelude.map ($ x) [return . (+ 1), return . (+ 2)] -- List of actions
-        & Stream.fromList                              -- Stream of actions
-        & Concur.sequenceWith (Concur.ordered True)    -- Sequence the actions concurrently
-        & Stream.fold Fold.toList                      -- Fold the resulting stream into a list
-```
-
-```haskell ghci
-import Data.Maybe (fromJust)
-
-f2 x =
-  let actionStream1 = Stream.fromPure (return $ show x)
-      actionStream2 = Stream.fromPure (return $ x + 1)
-      actionStream3 = Stream.fromPure (return $ fromIntegral x / 2)
-   in Stream.zipWith (\a (b, c) -> (a, b, c))
-          (Concur.sequence actionStream1)
-          (Stream.zipWith (,)
-               (Concur.sequence actionStream2)
-               (Concur.sequence actionStream3))
-          & Stream.fold Fold.one
-          & fmap fromJust
-```
-
-## Example 2,
-
-`haskell` blocks are not run in ghci directly but loaded in as a file.  And
-hence, these blocks cannot share the context and should be complete on their
-own.
+`markdown-doctest` will successfully validate this file.
 
 ```haskell
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-
-import Control.Monad.Catch (MonadThrow(..))
-import Control.Monad.IO.Class (MonadIO(..))
-import Control.Monad.Reader.Class (MonadReader(..))
-import Control.Monad.Trans.Class (MonadTrans(..))
-import Data.Function ((&))
-import Data.Maybe (fromJust)
-import Streamly.Data.Stream (Stream)
-import Streamly.Data.Stream.Concurrent (MonadAsync)
-
-import qualified Streamly.Data.Fold as Fold
-import qualified Streamly.Data.Stream
-import qualified Streamly.Data.Stream as Stream
-import qualified Streamly.Data.Stream.Concurrent
-import qualified Streamly.Data.Stream.Concurrent as Concur
-import qualified Streamly.Internal.Data.Stream.TypeGen as StreamTypeGen
-
-applyConcurrent :: MonadAsync m => Stream m (a -> b) -> Stream m a -> Stream m b
-applyConcurrent = Concur.zipWith ($)
-
-$(StreamTypeGen.mkZippingType "ZipConcurrent" "applyConcurrent" True)
-
-f2 x =
-  let actionStream1 = Stream.fromEffect (return $ show x)
-      actionStream2 = Stream.fromEffect (return $ x + 1)
-      actionStream3 = Stream.fromEffect (return $ fromIntegral x / 2)
-   in ((,,,)
-           <$> actionStream1
-           <*> actionStream2
-           <*> actionStream3)
-          & Stream.fold Fold.one
-          & fmap fromJust
+import qualified Prelude as P
 ```
 
-## Example 3,
+```haskell unshared
+import qualified Prelude as P
 
-`docspec` blocks can be used to check results after execution. The `ghci` block
-is a simpler version of `docspec` block.
+main =
+    P.print "Hello, World!"
+```
 
 ```haskell docspec
->>> import qualified Streamly.Internal.Data.Array as Array
->>> :{
-  Stream.fromList [1,2,3,4,5::Int]
-& Stream.scan (Array.writeLastN 2)
-& Stream.fold Fold.toList
-:}
-[fromList [],fromList [1],fromList [1,2],fromList [2,3],fromList [3,4],fromList [4,5]]
-
->>> g f2 [1,2,3,4::Int]
-[("1",2,0.5),("2",3,1.0),("3",4,1.5),("4",5,2.0)]
+>>> import qualified Prelude as P
 ```
 
-````
+```haskell
+main =
+    P.print "Hello, World!"
+```
+
+```haskell docspec
+>>> P.filter P.odd [1..10]
+[1,3,5,7,9]
+```

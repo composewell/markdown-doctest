@@ -10,8 +10,8 @@ import Data.Function ((&))
 import Data.List (find, isPrefixOf)
 import Streamly.Data.Fold (Fold)
 import Streamly.Data.Parser (Parser)
-import System.Environment (getArgs)
-
+import System.Environment (getArgs, lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
 import Control.Applicative (Alternative(..))
 import Streamly.Data.Stream (Stream)
 import Streamly.FileSystem.Path (Path)
@@ -26,6 +26,25 @@ import qualified Streamly.Unicode.Stream as Unicode
 import qualified Streamly.FileSystem.Path as Path
 
 import qualified Streamly.Internal.Data.Parser as Parser (takeFramedBy_)
+
+--------------------------------------------------------------------------------
+-- Env
+--------------------------------------------------------------------------------
+
+_ENV_VERBOSE :: Bool
+_ENV_VERBOSE = unsafePerformIO $ do
+    res <- lookupEnv "VERBOSE"
+    pure $ case res of
+      Nothing -> False
+      Just val -> read val
+
+printSection :: String -> String -> IO ()
+printSection tag contents = do
+    putStrLn $ "> " ++ replicate 77 '='
+    putStrLn $ "> " ++ tag
+    putStrLn $ "> " ++ replicate 77 '-'
+    putStr $ unlines $ map ("> " ++) $ lines contents
+    putStrLn $ "> " ++ replicate 77 '='
 
 --------------------------------------------------------------------------------
 -- Parse a block
@@ -135,6 +154,9 @@ createInterpretedFile contents =
 
 loadInterpretedFile :: G.Ghci -> IO ()
 loadInterpretedFile session = do
+    when _ENV_VERBOSE $ do
+        contents <- readFile "interpreted.hs"
+        printSection "File" contents
     res <- G.exec session ":load interpreted.hs"
     when (or (map hasErrorFile res)) $ do
         contents <- readFile "interpreted.hs"
@@ -152,6 +174,7 @@ loadInterpretedFile session = do
                 Just _ -> True
 
 runContents :: G.Ghci -> [Line] -> IO ()
+runContents _ [] = pure ()
 runContents session xs = do
     createInterpretedFile $ unlines xs
     loadInterpretedFile session
@@ -161,7 +184,6 @@ drainSharedSnippets s =
     Fold.filter isSharedSnip
         $ Fold.rmapM (runContents s)
         $ Fold.foldl' (\b a -> b ++ fromSnippet a) []
-
 
 drainUnsharedSnippets :: G.Ghci -> Fold IO Snippet ()
 drainUnsharedSnippets session =
@@ -214,6 +236,7 @@ runDocspecSnippet :: G.Ghci -> DocspecSnippet -> IO ()
 runDocspecSnippet session DocspecSnippet{..} = do
     when (not (null prompt)) $ do
         let combinedP = combinePrompt prompt
+        when _ENV_VERBOSE $ printSection "Prompt" (unlines prompt)
         res <- G.exec session combinedP
         if or (map hasErrorREPL res)
         then do

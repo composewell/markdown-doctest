@@ -1,271 +1,292 @@
+{-# LANGUAGE RecordWildCards #-}
+{-# OPTIONS_GHC -Wno-missing-kind-signatures #-}
+
 module Main (main) where
 
+import Control.Exception (bracket, throwIO)
 import Control.Monad (void, when)
-import Data.Char (isSpace)
+import Control.Monad.IO.Class (MonadIO (..))
 import Data.Function ((&))
 import Data.List (find, isPrefixOf)
 import Streamly.Data.Fold (Fold)
 import Streamly.Data.Parser (Parser)
 import System.Environment (getArgs)
 
+import Control.Applicative (Alternative(..))
+import Streamly.Data.Stream (Stream)
+import Streamly.FileSystem.Path (Path)
+import Streamly.Data.Parser (ParseError)
+
+import qualified Streamly.FileSystem.FileIO as File
 import qualified Language.Haskell.Ghcid as G
 import qualified Streamly.Data.Fold as Fold
 import qualified Streamly.Data.Parser as Parser
 import qualified Streamly.Data.Stream as Stream
-import qualified Streamly.Internal.Data.Fold as Fold (split_)
+import qualified Streamly.Unicode.Stream as Unicode
+import qualified Streamly.FileSystem.Path as Path
 
-haskellCodeStart :: String -> Bool
-haskellCodeStart = (==) "```haskell" . takeWhile (/= '\n')
+import qualified Streamly.Internal.Data.Parser as Parser (takeFramedBy_)
 
-ghciCodeStart :: String -> Bool
-ghciCodeStart = (==) "```haskell ghci" . takeWhile (/= '\n')
+--------------------------------------------------------------------------------
+-- Parse a block
+--------------------------------------------------------------------------------
 
-docspecCodeStart :: String -> Bool
-docspecCodeStart = (==) "```haskell docspec" . takeWhile (/= '\n')
+type Line = String
 
-codeEndIndicator :: String -> Bool
-codeEndIndicator = isPrefixOf "```"
+startsWith :: Line -> Line -> Bool
+startsWith prefix = isPrefixOf prefix
 
-blockEndIndicator :: String -> Bool
-blockEndIndicator [] = False
-blockEndIndicator (' ':_) = False
-blockEndIndicator _ = True
+data Snippet
+    = SHaskell [Line]
+    | SHaskellUnshared [Line]
+    | SHaskellDocspec [Line]
+    | SIgnore [Line]
+    deriving (Show)
 
-docspecIndicator :: String -> Bool
-docspecIndicator = isPrefixOf ">>>"
+fromSnippet :: Snippet -> [Line]
+fromSnippet (SHaskell xs) = xs
+fromSnippet (SHaskellUnshared xs) = xs
+fromSnippet (SHaskellDocspec xs) = xs
+fromSnippet (SIgnore xs) = xs
 
-docspecMultiIndicator :: String -> Bool
-docspecMultiIndicator = isPrefixOf ">>> :{"
+isSharedSnip :: Snippet -> Bool
+isSharedSnip (SHaskell _) = True
+isSharedSnip _ = False
 
-docspecMultiEndIndicator :: String -> Bool
-docspecMultiEndIndicator = isPrefixOf ":}"
+isUnsharedSnip :: Snippet -> Bool
+isUnsharedSnip (SHaskellUnshared _) = True
+isUnsharedSnip _ = False
 
-isInlineStatement :: String -> Bool
-isInlineStatement str = "{-# INLINE" `isPrefixOf` str
+isDocspecSnip :: Snippet -> Bool
+isDocspecSnip (SHaskellDocspec _) = True
+isDocspecSnip _ = False
 
-isSignature :: String -> Bool
-isSignature xs =
-    case words xs of
-        (_:b:_) -> not (isSpace (head xs)) && (b == "::")
-        _ -> False
+data Block =
+    Block
+        { isBlockStart :: Line -> Bool
+        , isBlockEnd :: Line -> Bool
+        , toSnippet :: [Line] -> Snippet
+        }
 
-snippet :: (String -> Bool) -> Fold IO (Int, String) [(Int, String)]
-snippet startIndicator =
-    Fold.split_
-        (Fold.takeEndBy_ (startIndicator . snd) Fold.drain)
-        (Fold.takeEndBy_ (codeEndIndicator . snd) Fold.toList)
+ignoreParser :: Monad m => Parser Line m Snippet
+ignoreParser =
+    Parser.takeWhile
+        (not . startsWith "```haskell")
+        (SIgnore <$> Fold.toList)
 
-data Block a
-    = WithMeta1 a
-    | WithMeta2 a
-    | WithoutMeta a
+mkBlockParser :: Monad m => Block -> Parser Line m Snippet
+mkBlockParser Block {..} =
+    Parser.takeFramedBy_ isBlockStart isBlockEnd (toSnippet <$> Fold.toList)
 
-unBlock :: Block a -> a
-unBlock (WithMeta1 a) = a
-unBlock (WithMeta2 a) = a
-unBlock (WithoutMeta a) = a
+sharedParser :: Monad m => Parser Line m Snippet
+sharedParser =
+    mkBlockParser $ Block ((==) "```haskell") ((==) "```") SHaskell
 
-haskellBlock :: Parser (Int, String) IO (Block [(Int, String)])
-haskellBlock = do
-    Just ln <- Parser.fromFold Fold.one
-    if isSignature (snd ln) || isInlineStatement (snd ln)
-    then do
-        Just nextln <- Parser.fromFold Fold.one
-        if isSignature (snd nextln) || isInlineStatement (snd nextln)
+unsharedParser :: Monad m => Parser Line m Snippet
+unsharedParser =
+    mkBlockParser $
+        Block
+            ((==) "```haskell unshared")
+            ((==) "```")
+            SHaskellUnshared
+
+docspecParser :: Monad m => Parser Line m Snippet
+docspecParser =
+    mkBlockParser $
+        Block
+            ((==) "```haskell docspec")
+            ((==) "```")
+            SHaskellDocspec
+
+combinedParser :: Monad m => Parser Line m Snippet
+combinedParser
+    = sharedParser
+  <|> unsharedParser
+  <|> docspecParser
+  <|> ignoreParser
+
+consumeParseError :: MonadIO m => Either ParseError a -> m a
+consumeParseError val =
+    case val of
+        Left err -> liftIO (throwIO err)
+        Right x -> pure x
+
+--------------------------------------------------------------------------------
+-- Block indicators
+--------------------------------------------------------------------------------
+
+-- XXX Having the following API will be useful:
+-- encodeUtf8Fold :: Fold m Char (Array Word8)
+getSnippetStream :: Path -> Stream IO Snippet
+getSnippetStream fp =
+    File.readChunks fp
+        & Unicode.decodeUtf8Chunks
+        & Stream.foldMany (Fold.takeEndBy_ (== '\n') Fold.toList)
+        & Stream.parseMany combinedParser
+        & Stream.mapM consumeParseError
+
+--------------------------------------------------------------------------------
+-- Consume Snippets
+--------------------------------------------------------------------------------
+
+createInterpretedFile :: String -> IO ()
+createInterpretedFile contents =
+    writeFile "interpreted.hs" contents
+
+loadInterpretedFile :: G.Ghci -> IO ()
+loadInterpretedFile session = do
+    res <- G.exec session ":load interpreted.hs"
+    when (or (map hasErrorFile res)) $ do
+        contents <- readFile "interpreted.hs"
+        putStrLn $ replicate 80 '='
+        putStrLn contents
+        putStrLn $ "Error: " ++ replicate 73 '-'
+        mapM_ putStrLn res
+        putStrLn $ replicate 80 '='
+        error "runSharedSnippet: error in interpreted.hs"
+    where
+    hasErrorFile out =
+        let xs = lines out
+         in case find ("interpreted.hs:" `isPrefixOf`) xs of
+                Nothing -> False
+                Just _ -> True
+
+runContents :: G.Ghci -> [Line] -> IO ()
+runContents session xs = do
+    createInterpretedFile $ unlines xs
+    loadInterpretedFile session
+
+drainSharedSnippets :: G.Ghci -> Fold IO Snippet ()
+drainSharedSnippets s =
+    Fold.filter isSharedSnip
+        $ Fold.rmapM (runContents s)
+        $ Fold.foldl' (\b a -> b ++ fromSnippet a) []
+
+
+drainUnsharedSnippets :: G.Ghci -> Fold IO Snippet ()
+drainUnsharedSnippets session =
+    Fold.filter
+        isUnsharedSnip
+        (Fold.drainMapM (runContents session . fromSnippet))
+
+--------------------------------------------------------------------------------
+-- Running docspec
+--------------------------------------------------------------------------------
+
+data DocspecSnippet
+    = DocspecSnippet
+          { prompt :: [Line]
+          , expectedResult :: [Line]
+          }
+
+promptParserSingle :: Monad m => Parser Line m Line
+promptParserSingle = drop 3 <$> Parser.satisfy (startsWith ">>>")
+
+promptParserMulti :: Monad m => Parser Line m [Line]
+promptParserMulti =
+    (\a b -> drop 4 a : b)
+        <$> Parser.satisfy (startsWith ">>> :{")
+        <*> Parser.fromFold (Fold.takeEndBy (startsWith ":}") Fold.toList)
+
+promptParserResult :: Monad m => Parser Line m [Line]
+promptParserResult = Parser.takeWhile (not . startsWith ">>>") Fold.toList
+
+promptParser :: Monad m => Parser Line m DocspecSnippet
+promptParser =
+    DocspecSnippet
+        <$> (promptParserMulti <|> ((:[]) <$> promptParserSingle))
+        <*> promptParserResult
+
+readDocspecSnippets :: MonadIO m => Stream m Line -> Stream m DocspecSnippet
+readDocspecSnippets inp =
+    Stream.mapM consumeParseError $ Stream.parseMany promptParser inp
+
+compareMinLines :: [Line] -> [Line] -> Bool
+compareMinLines [] [] = True
+compareMinLines [] xs = null $ dropWhile (== ' ') $ unwords xs
+compareMinLines xs [] = null $ dropWhile (== ' ') $ unwords xs
+compareMinLines (x:xs) (y:ys) =
+    if x == y
+    then compareMinLines xs ys
+    else False
+
+runDocspecSnippet :: G.Ghci -> DocspecSnippet -> IO ()
+runDocspecSnippet session DocspecSnippet{..} = do
+    when (not (null prompt)) $ do
+        let combinedP = combinePrompt prompt
+        res <- G.exec session combinedP
+        if or (map hasErrorREPL res)
         then do
-            Just nextNextln <- Parser.fromFold Fold.one
-            rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-            return $ WithMeta2 (ln : nextln : nextNextln : rest)
-        else do
-            rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-            return $ WithMeta1 (ln : nextln : rest)
-    else do
-        rest <- Parser.takeWhile (not . blockEndIndicator . snd) Fold.toList
-        return $ WithoutMeta (ln : rest)
-
-docspecBlock :: Parser (Int, String) IO ([(Int, String)], [(Int, String)])
-docspecBlock = do
-    Just ln <- Parser.fromFold Fold.one
-    rest <- Parser.takeWhile (not . docspecIndicator . snd) Fold.toList
-    if docspecMultiIndicator (snd ln)
-    then do
-        let specFld =
-                Fold.takeEndBy_ (docspecMultiEndIndicator . snd) Fold.toList
-            resFld = Fold.toList
-            fld = Fold.splitWith (,) specFld resFld
-        Parser.fromEffect (Stream.fold fld (Stream.fromList rest))
-    else do
-        let fld = Fold.toList
-        res <- Parser.fromEffect (Stream.fold fld (Stream.fromList rest))
-        return ([drop 4 <$> ln], res)
-
-extractSrcLoc :: Bool -> [(Int, String)] -> (Int, String)
-extractSrcLoc _ [] = (0, [])
-extractSrcLoc addNewlines xs@((i, _):_) =
-    if addNewlines
-    then (i, unlines (map snd xs))
-    else (i, concat (map snd xs))
-
-parseDocspecBlocks :: String -> IO [((Int, String), String)]
-parseDocspecBlocks s = do
-    let withLoc = zip [1 ..] (lines s)
-    res <-
-        Stream.fromList withLoc
-            & Stream.foldMany (snippet docspecCodeStart)
-            & Stream.mapM blocks
-            & Stream.fold Fold.toList
-    return
-        $ map (\(a, b) -> (extractSrcLoc True a, concat (map snd b)))
-        $ concat res
-
+            putStrLn $ replicate 80 '='
+            putStrLn combinedP
+            putStrLn $ "Error: " ++ replicate 73 '-'
+            mapM_ putStrLn res
+            putStrLn $ replicate 80 '='
+            error "runDocspecSnippet: Error"
+        else when (not (compareMinLines res expectedResult)) $ do
+            putStrLn $ replicate 80 '='
+            putStrLn combinedP
+            putStrLn $ "Expected: " ++ replicate 70 '-'
+            putStrLn (unlines expectedResult)
+            putStrLn $ "Got: " ++ replicate 75 '-'
+            putStrLn (unlines res)
+            putStrLn $ replicate 80 '='
+            error "runDocspecSnippet: Error"
     where
+    combinePrompt :: [Line] -> String
+    combinePrompt [] = undefined
+    combinePrompt [x] = x
+    combinePrompt xs = unlines xs
 
-    blocks =
-          Stream.fold Fold.toList
-        . fmap (either (error . show) id)
-        . Stream.parseMany docspecBlock
-        . Stream.fromList
+    hasErrorREPL out =
+        let xs = lines out
+         in case find ("<interactive>:" `isPrefixOf`) xs of
+                Nothing -> False
+                Just _ -> True
 
-parseString :: (String -> Bool) -> String -> IO [[Block [(Int, String)]]]
-parseString startIndicator s = do
-    let withLoc = zip [1 ..] (lines s)
-    Stream.fromList withLoc & Stream.foldMany (snippet startIndicator)
-        & Stream.mapM blocks
-        & Stream.fold Fold.toList
-
+drainDocspecSnippets :: G.Ghci -> Fold IO Snippet ()
+drainDocspecSnippets session =
+    Fold.filter isDocspecSnip (Fold.drainMapM run)
     where
+    run xs =
+        Stream.fromList (fromSnippet xs)
+            & readDocspecSnippets
+            & Stream.fold (Fold.drainMapM (runDocspecSnippet session))
 
-    blocks =
-        Stream.fold Fold.toList
-      . fmap (either (error . show) id)
-      . Stream.parseMany haskellBlock
-      . Stream.fromList
-
-saitizeREPLStatement :: String -> String
-saitizeREPLStatement str =
-    if "{-# LANGUAGE" `isPrefixOf` str
-    then ":set -X" ++ takeWhile (not . isSpace) (drop 13 str) ++ "\n"
-    else str
-
-parseStringREPL :: String -> IO [(Int, String)]
-parseStringREPL s = do
-    res <- parseString ghciCodeStart s
-    let blocks = concat res
-    return
-        $ filter (not . null . snd)
-        $ fmap
-              (fmap (\x -> ":{\n" ++ saitizeREPLStatement x ++ ":}")
-                   . extractSrcLoc True)
-        $ loopBlocks blocks
-
-    where
-
-    -- This is reqiured because for some reason, GhcId can't register signatures
-    -- after a while. Functions don't get into scope after a while.
-    loopBlocks [] = []
-    loopBlocks (WithMeta1 b:bs) = [b, drop 1 b] ++ loopBlocks bs
-    loopBlocks (WithMeta2 b:bs) = [b, drop 2 b] ++ loopBlocks bs
-    loopBlocks (WithoutMeta b:bs) = [b] ++ loopBlocks bs
-
-hasErrorREPL :: String -> Bool
-hasErrorREPL out =
-    let xs = lines out
-     in case find ("<interactive>:" `isPrefixOf`) xs of
-            Nothing -> False
-            Just _ -> True
-
-parseStringFile :: String -> IO [(Int, String)]
-parseStringFile s = do
-    res <- parseString haskellCodeStart s
-    return
-        $ filter (not . null . snd)
-        $ fmap (extractSrcLoc False)
-        $ fmap (fmap (extractSrcLoc True . unBlock)) res
-
-hasErrorFile :: String -> Bool
-hasErrorFile out =
-    let xs = lines out
-     in case find ("interpreted.hs:" `isPrefixOf`) xs of
-            Nothing -> False
-            Just _ -> True
-
-loopCmdDocspec :: G.Ghci -> [((Int, String), String)] -> IO Bool
-loopCmdDocspec _ [] = putStrLn "All good" >> return True
-loopCmdDocspec sess (((i, spec), result):rest) = do
-    putStrLn spec
-    res <- G.exec sess (":{\n" ++ spec ++ ":}")
-    if or (map hasErrorREPL res)
-    then do
-        mapM_ putStrLn res
-        putStrLn ("Error at: " ++ show i)
-        return False
-    else let resNN = takeWhile (not . null) res
-             resNLen = length (dropWhile (not . null) res)
-             resultLines = lines result
-             resultNN = takeWhile (not . null) resultLines
-             resultNLen = length (dropWhile (not . null) resultLines)
-          in if resNN == resultNN && resNLen <= resultNLen
-             then loopCmdDocspec sess rest
-             else do
-                 putStrLn ("Error at: " ++ show i)
-                 putStrLn $ unlines ["Expected:", result, "Got:", unlines res]
-                 return False
-
-loopCmdREPL :: G.Ghci -> [(Int, String)] -> IO Bool
-loopCmdREPL _ [] = putStrLn "All good" >> return True
-loopCmdREPL sess (ln:lns) = do
-    putStrLn (snd ln)
-    res <- G.exec sess (snd ln)
-    if or (map hasErrorREPL res)
-    then do
-        mapM_ putStrLn res
-        putStrLn ("Error at: " ++ show (fst ln))
-        return False
-    else loopCmdREPL sess lns
-
-loopCmdFile :: G.Ghci -> [(Int, String)] -> IO Bool
-loopCmdFile _ [] = putStrLn "All good" >> return True
-loopCmdFile sess (ln:lns) = do
-    let padding = replicate (fst ln - 1) '\n'
-    writeFile ("interpreted.hs") (padding ++ snd ln)
-    putStrLn (snd ln)
-    res <- G.exec sess ":load interpreted.hs"
-    if or (map hasErrorFile res)
-    then do
-        mapM_ putStrLn res
-        putStrLn ("Error at: " ++ show (fst ln))
-        return False
-    else loopCmdFile sess lns
-
-ghciSetup :: [String]
-ghciSetup = [":set -fobject-code"]
+--------------------------------------------------------------------------------
+-- Main
+--------------------------------------------------------------------------------
 
 main :: IO ()
-main = do
-    args <- getArgs
-    (ghciSession, _) <-
-        G.startGhci
-            "ghci"
-            (Just ".")
-            (\strm str ->
-                 case strm of
-                     G.Stdout -> putStrLn ("<stdout>: " ++ str)
-                     G.Stderr -> putStrLn ("<stderr>: " ++ str))
-    sequence_ $ map (G.exec ghciSession) ghciSetup
-    void $ G.reload ghciSession
-    let fileName =
-            case args of
-                [x] -> x
-                _ -> error "Expecting exactly 1 argument"
-    contents <- readFile fileName
-    parsedREPL <- parseStringREPL contents
-    r1 <- loopCmdREPL ghciSession parsedREPL
-    r2 <- if r1
-          then do
-            parsedDocspec <- parseDocspecBlocks contents
-            loopCmdDocspec ghciSession parsedDocspec
-          else return False
-    when r2 $ do
-        parsedFile <- parseStringFile contents
-        void $ loopCmdFile ghciSession parsedFile
-    G.stopGhci ghciSession
+main =
+    bracket alloc release with
+    where
+    alloc = do
+        (session, _) <-
+            G.startGhci
+                "ghci"
+                (Just ".")
+                (\strm str ->
+                     case strm of
+                         G.Stdout -> putStrLn ("<stdout>: " ++ str)
+                         G.Stderr -> putStrLn ("<stderr>: " ++ str))
+        pure session
+    release = G.stopGhci
+    with session = do
+        args <- getArgs
+        let setup = [":set -fobject-code"]
+        sequence_ $ map (G.exec session) setup
+        void $ G.reload session
+        let fileS =
+                case args of
+                    [x] -> x
+                    _ -> error "Expecting exactly 1 argument"
+        fileP <- Path.fromString fileS
+        getSnippetStream fileP
+            & Stream.fold
+                  (Fold.distribute
+                       [ drainSharedSnippets session
+                       , drainUnsharedSnippets session
+                       , drainDocspecSnippets session
+                       ])
+            & void

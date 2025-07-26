@@ -12,7 +12,11 @@ $ cabal install markdown-doctest
 $ ./markdown-doctest <filename.md>
 ```
 
-Note: The ghc environment file should exist.
+The ghc environment file should exist in the package being tested:
+
+```
+$ cabal build --write-ghc-environment-files=always
+```
 
 ## Syntax
 
